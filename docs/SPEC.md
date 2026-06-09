@@ -12,21 +12,21 @@ Minimal, idiomatic Go layout:
 ad-service/
 ├── cmd/
 │   └── server/
-│       └── main.go          # Application entry point
+│       └── main.go              # Application entry point
 ├── internal/
 │   ├── delivery/
-│   │   └── http/            # API route handlers (Admin & Public)
+│   │   └── http/                # API route handlers (Admin & Public)
 │   ├── model/
-│   │   └── ad.go            # Data structures & validation (Ad, Conditions)
+│   │   └── ad.go                # Data structures & validation (Ad, Conditions)
 │   ├── repository/
-│   │   └── ad_repo.go       # Storage layer logic (DB/Cache)
+│   │   └── ad_repo.go           # Storage layer logic (DB/Cache)
 │   └── service/
-│       └── ad_service.go    # Core business logic & filtering algorithms
+│       └── ad_service.go        # Core business logic & filtering algorithms
 ├── docs/
-│   └── SPEC.md              # This document
+│   └── SPEC.md                  # This document
 ├── go.mod
 ├── go.sum
-└── README.md                # System design & thought process
+└── README.md                    # System design & thought process
 ```
 
 ---
@@ -39,7 +39,7 @@ ad-service/
 |----------|-------|
 | **Method** | `POST` |
 | **Path** | `/api/v1/ad` |
-| **Purpose** | Create advertisement resources. Only **Create** is required (no list, update, or delete). |
+| **Purpose** | Create advertisement resources. |
 
 #### Request Body
 
@@ -48,6 +48,12 @@ Each advertisement must include the following fields:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `title` | `string` | Yes | Title of the advertisement. |
+| `description` | `string` | No | Body/description text of the ad. |
+| `imageUrl` | `string` | No | URL to the ad creative image. |
+| `landingPageUrl` | `string` | No | Destination URL when the ad is clicked. |
+| `bid` | `number` | No | CPM bid price. Higher bid = higher priority in delivery ranking. |
+| `dailyBudget` | `integer` | No | Maximum number of daily impressions for this ad. |
+| `status` | `string` | No | Lifecycle state: `active`, `paused`, or `archived`. Defaults to `active`. |
 | `startAt` | `string` (ISO 8601) | Yes | Start of the active display window. |
 | `endAt` | `string` (ISO 8601) | Yes | End of the active display window. Must be after `startAt`. |
 | `conditions` | `object` | No | Targeting criteria (see below). |
@@ -64,16 +70,30 @@ Each condition may accept **multiple values** (e.g., an ad can target both `TW` 
 | **Gender** | Enum array | `M`, `F` |
 | **Country** | Enum array | ISO 3166-1 alpha-2 codes (e.g., `TW`, `JP`). |
 | **Platform** | Enum array | `android`, `ios`, `web` |
+| **Exclude Gender** | Enum array | `M`, `F` — users matching these values are excluded. |
+| **Exclude Country** | Enum array | ISO 3166-1 alpha-2 codes — users in these countries are excluded. |
+| **Exclude Platform** | Enum array | `android`, `ios`, `web` — users on these platforms are excluded. |
+| **Daypart Start** | Time (HH:MM) | Start of the daily time window (e.g., `09:00`). Must be paired with `daypartEnd`. |
+| **Daypart End** | Time (HH:MM) | End of the daily time window (e.g., `17:00`). Must be paired with `daypartStart`. |
+
+Exclusion rules are evaluated **before** inclusion rules. If an exclusion condition matches, the ad is excluded regardless of inclusion conditions.
+
+Dayparting supports overnight windows (e.g., `22:00`–`06:00`) where `daypartStart > daypartEnd`.
 
 #### Example Request
 
-Create an ad targeting users aged 20–30, in Taiwan or Japan, on Android or iOS, with no gender restriction:
+Create an ad targeting users aged 20–30, in Taiwan or Japan, on Android or iOS, with no gender restriction, a bid of $2.50 CPM, and a daily budget of 10,000 impressions:
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   "http://localhost:8080/api/v1/ad" \
   --data '{
     "title": "AD 55",
+    "description": "Check out our latest product!",
+    "imageUrl": "https://cdn.example.com/ad55.jpg",
+    "landingPageUrl": "https://example.com/landing",
+    "bid": 2.50,
+    "dailyBudget": 10000,
     "startAt": "2026-06-10T03:00:00.000Z",
     "endAt": "2026-06-30T16:00:00.000Z",
     "conditions": {
@@ -85,9 +105,54 @@ curl -X POST -H "Content-Type: application/json" \
   }'
 ```
 
+#### Idempotency
+
+The Admin API supports optional idempotency via the `Idempotency-Key` header. If a request with the same key is received within 5 minutes, the previously created ad is returned instead of creating a duplicate.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -H "Idempotency-Key: my-unique-key-123" \
+  "http://localhost:8080/api/v1/ad" \
+  --data '{
+    "title": "AD 55",
+    "startAt": "2026-06-10T03:00:00.000Z",
+    "endAt": "2026-06-30T16:00:00.000Z"
+  }'
+```
+
 ---
 
-### 2. Public Delivery API — List Matching Ads
+### 2. Admin API — Bulk Create Advertisements
+
+| Property | Value |
+|----------|-------|
+| **Method** | `POST` |
+| **Path** | `/api/v1/ads` |
+| **Purpose** | Create multiple advertisements in a single request. |
+
+#### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ads` | `array` | Yes | Array of ad creation requests (same schema as single create). |
+
+#### Response Body
+
+```json
+{
+  "ads": [
+    { "id": 1, "title": "Ad 1", ... },
+    { "id": 2, "title": "Ad 2", ... }
+  ],
+  "failures": [
+    { "index": 2, "error": "title must be a non-empty string" }
+  ]
+}
+```
+
+---
+
+### 3. Public Delivery API — List Matching Ads
 
 | Property | Value |
 |----------|-------|
@@ -100,8 +165,10 @@ curl -X POST -H "Content-Type: application/json" \
 An ad is **active** when:
 
 ```
-StartAt < NOW < EndAt
+Status = "active" AND StartAt < NOW < EndAt
 ```
+
+Ads with status `paused` or `archived` are excluded from delivery.
 
 #### Query Parameters
 
@@ -120,20 +187,28 @@ StartAt < NOW < EndAt
 
 An ad matches a request when **all** of the following hold:
 
-1. The ad is **active** at request time.
-2. For each provided user attribute, the ad's corresponding condition is either **unset** (no restriction) or **includes** the user's value:
+1. The ad is **active** at request time (status = `active` and within time window).
+2. For each provided user attribute, the ad does **not** exclude the user, and the ad's corresponding condition is either **unset** (no restriction) or **includes** the user's value:
    - **Age:** `ageStart ≤ userAge ≤ ageEnd` (if either bound is set).
-   - **Gender:** user's gender is in the ad's `gender` list (if set).
-   - **Country:** user's country is in the ad's `country` list (if set).
-   - **Platform:** user's platform is in the ad's `platform` list (if set).
+   - **Gender:** user's gender is not in `excludeGender`; if `gender` is set, user's gender must be in the list.
+   - **Country:** user's country is not in `excludeCountry`; if `country` is set, user's country must be in the list.
+   - **Platform:** user's platform is not in `excludePlatform`; if `platform` is set, user's platform must be in the list.
+3. If dayparting is configured, the current time falls within the specified daily window.
+4. The ad has not exceeded its `dailyBudget` (if set).
 
 #### Sorting
 
-Results are sorted by `endAt` in **ascending** order (earliest ending ad first).
+Results are sorted by:
+1. **Bid** descending (highest bid first, where `bid > 0`).
+2. **EndAt** ascending (earliest ending ad first) as tiebreaker.
 
 #### Pagination
 
 Use `offset` and `limit` query parameters. Return at most `limit` items after skipping `offset` records from the sorted result set.
+
+#### Budget Tracking
+
+When `dailyBudget` is set on an ad, the service tracks impressions served per ad per day in-memory. Once the impression count reaches the budget, the ad stops being delivered until the next day.
 
 #### Example Request
 
@@ -151,21 +226,35 @@ Returns up to `limit` matching active ads:
   "items": [
     {
       "title": "AD 1",
+      "description": "Check out our latest product!",
+      "imageUrl": "https://cdn.example.com/ad1.jpg",
+      "landingPageUrl": "https://example.com/ad1",
       "endAt": "2026-06-22T01:00:00.000Z"
     },
     {
       "title": "AD 31",
       "endAt": "2026-06-30T12:00:00.000Z"
-    },
-    {
-      "title": "AD 10",
-      "endAt": "2026-06-30T16:00:00.000Z"
     }
   ]
 }
 ```
 
-Public list responses expose only `title` and `endAt` per item.
+Public list responses expose `title`, `endAt`, and optionally `description`, `imageUrl`, `landingPageUrl` per item.
+
+---
+
+### 4. Admin API — Rate Limiting
+
+Admin endpoints (`POST /api/v1/ad` and `POST /api/v1/ads`) are rate-limited per IP address. The default limit is **100 requests per minute** per client IP. When exceeded, the API returns HTTP `429 Too Many Requests`:
+
+```json
+{
+  "error": {
+    "code": "RATE_LIMITED",
+    "message": "too many requests, try again later"
+  }
+}
+```
 
 ---
 
@@ -189,7 +278,7 @@ Public list responses expose only `title` and `endAt` per item.
 
 ### Testing
 
-- Write unit tests covering business logic, validation, filtering, sorting, and pagination.
+- Write unit tests covering business logic, validation, filtering, sorting, pagination, exclusion targeting, dayparting, bid-based sorting, budget tracking, bulk creation, and lifecycle status.
 
 ### Authentication
 
@@ -226,6 +315,12 @@ Public list responses expose only `title` and `endAt` per item.
 | Field | Rules |
 |-------|-------|
 | `title` | Non-empty string. |
+| `description` | Optional string. |
+| `imageUrl` | Optional string. |
+| `landingPageUrl` | Optional string. |
+| `bid` | Optional; non-negative float. Defaults to `0`. |
+| `dailyBudget` | Optional; non-negative integer. |
+| `status` | Optional; must be `active`, `paused`, or `archived`. Defaults to `active`. |
 | `startAt` | Valid ISO 8601 timestamp. |
 | `endAt` | Valid ISO 8601 timestamp; must be after `startAt`. |
 | `conditions.ageStart` | Optional; if set, integer 1–100. |
@@ -233,6 +328,11 @@ Public list responses expose only `title` and `endAt` per item.
 | `conditions.gender` | Optional; each value must be `M` or `F`. |
 | `conditions.country` | Optional; each value must be a valid ISO 3166-1 alpha-2 code. |
 | `conditions.platform` | Optional; each value must be `android`, `ios`, or `web`. |
+| `conditions.excludeGender` | Optional; each value must be `M` or `F`. |
+| `conditions.excludeCountry` | Optional; each value must be a valid ISO 3166-1 alpha-2 code. |
+| `conditions.excludePlatform` | Optional; each value must be `android`, `ios`, or `web`. |
+| `conditions.daypartStart` | Optional; must be paired with `daypartEnd`. Format: `HH:MM` (00:00–23:59). |
+| `conditions.daypartEnd` | Optional; must be paired with `daypartStart`. Format: `HH:MM` (00:00–23:59). |
 
 ### Public API — List
 
@@ -247,7 +347,7 @@ Public list responses expose only `title` and `endAt` per item.
 
 ---
 
-## Error Response Format (Recommended)
+## Error Response Format
 
 Use a consistent JSON error shape across both APIs:
 
@@ -266,4 +366,5 @@ Suggested HTTP status codes:
 |--------|-------|
 | `400 Bad Request` | Validation failures, malformed JSON. |
 | `405 Method Not Allowed` | Wrong HTTP method on a route. |
+| `429 Too Many Requests` | Rate limit exceeded. |
 | `500 Internal Server Error` | Unexpected server failures. |

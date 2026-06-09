@@ -1,11 +1,15 @@
 package httpdelivery
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/1chooo/ad-service/internal/model"
 	"github.com/1chooo/ad-service/internal/service"
@@ -13,22 +17,40 @@ import (
 )
 
 type Handler struct {
-	svc *service.AdService
+	svc         *service.AdService
+	rateLimiter *RateLimiter
+	idempotent  *IdempotencyStore
 }
 
 func NewHandler(svc *service.AdService) *Handler {
-	return &Handler{svc: svc}
+	return &Handler{
+		svc:         svc,
+		rateLimiter: NewRateLimiter(100, time.Minute),
+		idempotent:  NewIdempotencyStore(5 * time.Minute),
+	}
 }
 
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/health", h.health)
 	r.MethodFunc(http.MethodGet, "/api/v1/ad", h.listAds)
-	r.MethodFunc(http.MethodPost, "/api/v1/ad", h.createAd)
+	r.With(h.adminRateLimit).MethodFunc(http.MethodPost, "/api/v1/ad", h.createAd)
+	r.With(h.adminRateLimit).MethodFunc(http.MethodPost, "/api/v1/ads", h.bulkCreateAds)
 	r.MethodFunc(http.MethodPut, "/api/v1/ad", methodNotAllowed)
 	r.MethodFunc(http.MethodPatch, "/api/v1/ad", methodNotAllowed)
 	r.MethodFunc(http.MethodDelete, "/api/v1/ad", methodNotAllowed)
 	return r
+}
+
+func (h *Handler) adminRateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := extractIP(r)
+		if !h.rateLimiter.Allow(ip) {
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, try again later")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
@@ -43,6 +65,23 @@ func (h *Handler) createAd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if key := r.Header.Get("Idempotency-Key"); key != "" {
+		if cached, ok := h.idempotent.Get(key); ok {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+
+		ad, err := h.svc.CreateAd(r.Context(), req)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+
+		h.idempotent.Set(key, ad)
+		writeJSON(w, http.StatusCreated, ad)
+		return
+	}
+
 	ad, err := h.svc.CreateAd(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
@@ -50,6 +89,22 @@ func (h *Handler) createAd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, ad)
+}
+
+func (h *Handler) bulkCreateAds(w http.ResponseWriter, r *http.Request) {
+	var req model.BulkCreateAdRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, model.ErrCodeInvalidArgument, "request body must be valid JSON")
+		return
+	}
+
+	resp, err := h.svc.BulkCreateAds(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) listAds(w http.ResponseWriter, r *http.Request) {
@@ -146,4 +201,126 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func extractIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		parts := strings.SplitN(fwd, ",", 2)
+		return strings.TrimSpace(parts[0])
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return strings.TrimSpace(realIP)
+	}
+	addr := r.RemoteAddr
+	if idx := strings.LastIndex(addr, ":"); idx != -1 {
+		return addr[:idx]
+	}
+	return addr
+}
+
+type RateLimiter struct {
+	mu       sync.Mutex
+	visitors map[string]*rateEntry
+	limit    int
+	window   time.Duration
+}
+
+type rateEntry struct {
+	count   int
+	resetAt time.Time
+}
+
+func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
+	return &RateLimiter{
+		visitors: make(map[string]*rateEntry),
+		limit:    limit,
+		window:   window,
+	}
+}
+
+func (rl *RateLimiter) Allow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	entry, ok := rl.visitors[key]
+
+	if !ok || now.After(entry.resetAt) {
+		rl.visitors[key] = &rateEntry{
+			count:   1,
+			resetAt: now.Add(rl.window),
+		}
+		return true
+	}
+
+	if entry.count >= rl.limit {
+		return false
+	}
+
+	entry.count++
+	return true
+}
+
+type IdempotencyStore struct {
+	mu   sync.Mutex
+	data map[string]*idempotentEntry
+	ttl  time.Duration
+}
+
+type idempotentEntry struct {
+	response  any
+	expiresAt time.Time
+}
+
+func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
+	s := &IdempotencyStore{
+		data: make(map[string]*idempotentEntry),
+		ttl:  ttl,
+	}
+	go s.cleanup()
+	return s
+}
+
+func (s *IdempotencyStore) Get(key string) (any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, ok := s.data[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		if ok {
+			delete(s.data, key)
+		}
+		return nil, false
+	}
+
+	return entry.response, true
+}
+
+func (s *IdempotencyStore) Set(key string, response any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	h := sha256.Sum256([]byte(fmt.Sprintf("%v", response)))
+	_ = h
+
+	s.data[key] = &idempotentEntry{
+		response:  response,
+		expiresAt: time.Now().Add(s.ttl),
+	}
+}
+
+func (s *IdempotencyStore) cleanup() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		now := time.Now()
+		for key, entry := range s.data {
+			if now.After(entry.expiresAt) {
+				delete(s.data, key)
+			}
+		}
+		s.mu.Unlock()
+	}
 }

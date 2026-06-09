@@ -13,14 +13,35 @@ import (
 
 const migrationSQL = `
 CREATE TABLE IF NOT EXISTS ads (
-  id         BIGSERIAL PRIMARY KEY,
-  title      TEXT NOT NULL,
-  start_at   TIMESTAMPTZ NOT NULL,
-  end_at     TIMESTAMPTZ NOT NULL,
-  conditions JSONB NOT NULL DEFAULT '{}',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id               BIGSERIAL PRIMARY KEY,
+  title            TEXT NOT NULL,
+  description      TEXT NOT NULL DEFAULT '',
+  image_url        TEXT NOT NULL DEFAULT '',
+  landing_page_url TEXT NOT NULL DEFAULT '',
+  bid              DOUBLE PRECISION NOT NULL DEFAULT 0,
+  daily_budget     BIGINT,
+  status           TEXT NOT NULL DEFAULT 'active',
+  start_at         TIMESTAMPTZ NOT NULL,
+  end_at           TIMESTAMPTZ NOT NULL,
+  conditions       JSONB NOT NULL DEFAULT '{}',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_ads_active ON ads (start_at, end_at);
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE indexname = 'idx_ads_active'
+  ) THEN
+    CREATE INDEX idx_ads_active ON ads (start_at, end_at);
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE indexname = 'idx_ads_status'
+  ) THEN
+    CREATE INDEX idx_ads_status ON ads (status);
+  END IF;
+END $$;
 `
 
 type AdRepository struct {
@@ -61,10 +82,10 @@ func (r *AdRepository) Create(ctx context.Context, ad *model.Ad) error {
 	}
 
 	err = r.pool.QueryRow(ctx, `
-		INSERT INTO ads (title, start_at, end_at, conditions)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO ads (title, description, image_url, landing_page_url, bid, daily_budget, status, start_at, end_at, conditions)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id, created_at
-	`, ad.Title, ad.StartAt, ad.EndAt, conditionsJSON).Scan(&ad.ID, &ad.CreatedAt)
+	`, ad.Title, ad.Description, ad.ImageUrl, ad.LandingPageUrl, ad.Bid, ad.DailyBudget, ad.Status, ad.StartAt, ad.EndAt, conditionsJSON).Scan(&ad.ID, &ad.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("insert ad: %w", err)
 	}
@@ -74,9 +95,9 @@ func (r *AdRepository) Create(ctx context.Context, ad *model.Ad) error {
 
 func (r *AdRepository) ListActive(ctx context.Context, now time.Time) ([]model.Ad, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, title, start_at, end_at, conditions, created_at
+		SELECT id, title, description, image_url, landing_page_url, bid, daily_budget, status, start_at, end_at, conditions, created_at
 		FROM ads
-		WHERE start_at < $1 AND end_at > $1
+		WHERE start_at < $1 AND end_at > $1 AND status = 'active'
 		ORDER BY end_at ASC
 	`, now)
 	if err != nil {
@@ -125,7 +146,7 @@ func scanAd(row rowScanner) (model.Ad, error) {
 	var ad model.Ad
 	var conditionsJSON []byte
 
-	if err := row.Scan(&ad.ID, &ad.Title, &ad.StartAt, &ad.EndAt, &conditionsJSON, &ad.CreatedAt); err != nil {
+	if err := row.Scan(&ad.ID, &ad.Title, &ad.Description, &ad.ImageUrl, &ad.LandingPageUrl, &ad.Bid, &ad.DailyBudget, &ad.Status, &ad.StartAt, &ad.EndAt, &conditionsJSON, &ad.CreatedAt); err != nil {
 		return model.Ad{}, fmt.Errorf("scan ad: %w", err)
 	}
 
@@ -133,6 +154,10 @@ func scanAd(row rowScanner) (model.Ad, error) {
 		if err := json.Unmarshal(conditionsJSON, &ad.Conditions); err != nil {
 			return model.Ad{}, fmt.Errorf("unmarshal conditions: %w", err)
 		}
+	}
+
+	if ad.Status == "" {
+		ad.Status = model.StatusActive
 	}
 
 	return ad, nil
